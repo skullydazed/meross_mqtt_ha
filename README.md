@@ -6,7 +6,7 @@ Listens on MQTT for Meross outlets and bridges them to Home Assistant. This has 
 
 The easiest way to use this is with the docker container. You can probably run it like this:
 
-    docker run skullydazed/meross_mqtt_ha
+    docker run --network=mqtt -e MQTT_HOST=mosquitto skullydazed/meross_mqtt_ha
 
 You can set the following environment variables to configure behavior:
 
