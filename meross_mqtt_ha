@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Listens on MQTT for Meross outlets and bridges them to Home Assistant.
+"""
+import json
+import os
+from hashlib import md5
+from pathlib import Path
+from time import time
+from uuid import uuid4
+
+import paho.mqtt.client
+import paho.mqtt.publish
+
+DEBUG = os.environ.get('DEBUG') == 1
+HOMEASSISTANT_PREFIX = os.environ.get('HOMEASSISTANT_PREFIX', 'homeassistant')
+MEROSS_SHARED_KEY = os.environ.get('MEROSS_SHARED_KEY', '')
+MQTT_CLIENT_ID=os.environ.get('MQTT_CLIENT_ID', 'meross_mqtt_ha')
+MQTT_HOST=os.environ.get('MQTT_HOST', 'localhost')
+MQTT_PORT = int(os.environ.get('MQTT_PORT', '1883'))
+MQTT_QOS = int(os.environ.get('MQTT_QOS', 1))
+MQTT_TOPIC = os.environ.get('MQTT_TOPIC', f'/appliance/#,{HOMEASSISTANT_PREFIX}/switch/meross_mqtt/#')
+DISCOVERY_TOPIC = HOMEASSISTANT_PREFIX + '/switch/meross_mqtt/{}/config'
+
+
+def outlet_skeleton(powered_on=True, channel=0):
+    """Returns a basic definition for an outlet toggle packet.
+    """
+    return {
+        'header': {
+            'from': "/appliance/controller",
+            'method': "SET",
+            'namespace': "Appliance.Control.ToggleX",
+            'payloadVersion': 1
+        },
+        'payload': {
+             'togglex': {
+                  'channel': 0,
+                  'onoff': 1 if powered_on else 0
+             }
+        }
+    }
+
+
+def sign_packet(packet):
+    """Return a signed version of the packet.
+    """
+    packet['header']['timestamp'] = int(time())
+    packet['header']['messageId'] = uuid4().hex
+    sign = packet['header']['messageId'] + MEROSS_SHARED_KEY + str(packet['header']['timestamp'])
+    packet['header']['sign'] = md5(sign.encode('utf-8')).hexdigest()
+
+    return packet
+
+
+def mqtt_send(topic, payload, retain=False):
+    """Send a payload to an mqtt topic, encoding as JSON if it's not a string.
+    """
+    if type(payload) != str:
+        payload = json.dumps(payload)
+
+    try:
+        if DEBUG:
+            print(f'Sending to MQTT: {topic}: {payload}')
+        paho.mqtt.publish.single(topic, payload=payload, qos=MQTT_QOS, hostname=MQTT_HOST, port=MQTT_PORT, retain=retain)
+
+    except Exception as ex:
+        print("MQTT Publish Failed: " + str(ex))
+
+
+def on_connect(mqtt, userdata, flags, rc):
+    """Callback for MQTT connects."""
+    #print("MQTT connected: " + mqtt.connack_string(rc))
+    print("MQTT connected")
+
+    if rc != 0:
+        print("Could not connect. Error: " + str(rc))
+    else:
+        for topic in MQTT_TOPIC.split(','):
+            mqtt.subscribe(topic.strip())
+
+
+def on_disconnect(mqtt, userdata, rc):
+    """Callback for MQTT disconnects."""
+    print("MQTT disconnected: " + mqtt.connack_string(rc))
+
+
+def on_log(mqtt, obj, level, string):
+    if level < 16 or DEBUG:
+        print(f'*** {level}: {string}')
+
+
+def on_message(mqtt, userdata, msg):
+    """Callback for MQTT message PUBLISH."""
+    topic = msg.topic.split('/')
+
+    if topic[0] == HOMEASSISTANT_PREFIX:
+        return process_homeassistant(topic, msg.payload.decode('utf-8'))
+
+    packet = json.loads(msg.payload)
+    return process_meross(topic, packet)
+
+
+def process_homeassistant(topic, payload):
+    """Called when processing a homeassistant payload.
+    """
+    if topic[-1] == 'set':
+        outlet_id = topic[3]
+        plug_id = topic[4]
+        onoff = payload == 'ON'
+        command_packet = sign_packet(outlet_skeleton(onoff, plug_id))
+        print('process_homeassistant', outlet_id, command_packet)
+        mqtt_send(f'/appliance/{outlet_id}/subscribe', command_packet)
+
+
+def process_meross(topic, packet):
+    """Called when processing a meross payload.
+    """
+    outlet_id = topic[2]
+
+    if outlet_id == 'controller':
+        # It's a message in response to something we sent
+        print('Response packet:', packet)
+        return
+
+    if topic[3] == 'subscribe':
+        # Ignore our own packets.
+        return
+
+    if packet['header']['namespace'] == 'Appliance.System.Clock' and packet['header']['method'] == 'PUSH':
+        # /appliance/1909186558887525186548e1e9054b50/publish {"header":{"messageId":"a1605224f8b808178c8bdac5d8e239dc","namespace":"Appliance.System.Clock","method":"PUSH","payloadVersion":1,"from":"/appliance/1909186558887525186548e1e9054b50/publish","timestamp":4,"timestampMs":257,"sign":"27f5352964c535596c659880231f8ff9"},"payload":{"clock":{"timestamp":4}}}
+        print(f'Received clock signal from {outlet_id}.')
+
+    if packet['header']['namespace'] == 'Appliance.System.Report' and packet['header']['method'] == 'PUSH':
+        # This is sent when the outlet has booted and is ready.
+        # /appliance/1909186558887525186548e1e9054b50/publish {"header":{"messageId":"a97dd90c9e0f42a8de14fd6510bf98f7","namespace":"Appliance.System.Report","method":"PUSH","payloadVersion":1,"from":"/appliance/1909186558887525186548e1e9054b50/publish","timestamp":1594520169,"timestampMs":272,"sign":"ba847d1fe461a7f7e49e9117813a8f80"},"payload":{"report":[{"type":"1","value":"1","timestamp":1594520169}]}}
+        print(f'Received Appliance.System.Report from {outlet_id}:')
+        print(packet)
+
+    if packet['header']['namespace'] == 'Appliance.Control.Bind' and packet['header']['method'] == 'PUSH':
+        # This is sent after the pairing process completes.
+        # /appliance/1909186558887525186548e1e9054b50/publish {
+        #    "header":{
+        #        "messageId":"9565a7b2576e1cc1ef3a71014aef14af",
+        #        "namespace":"Appliance.Control.Bind",
+        #        "method":"PUSH",
+        #        "payloadVersion":1,
+        #        "from":"/appliance/1909186558887525186548e1e9054b50/publish",
+        #        "timestamp":1594520169,
+        #        "timestampMs":281,
+        #        "sign":"6917de4509bd834dd600041d6289c1ce"
+        #    },
+        #    "payload":{
+        #        "bind":{
+        #            "bindTime":1594520169,
+        #            "time":{
+        #                "timestamp":1594520169,
+        #                "timezone":"",
+        #                "timeRule":[]
+        #            },
+        #            "hardware":{
+        #                "type":"mss110",
+        #                "subType":"us",
+        #                "version":"2.0.0",
+        #                "chipType":"mt7682",
+        #                "uuid":"1909186558887525186548e1e9054b50",
+        #                "macAddress":"48:e1:e9:05:4b:50"
+        #            },
+        #            "firmware":{
+        #                "version":"2.1.19",
+        #                "compileTime":"2020/04/15 17:02:04 GMT +08:00",
+        #                "wifiMac":"0c:80:63:dd:df:33",
+        #                "innerIp":"172.16.25.219",
+        #                "server":"172.16.25.2",
+        #                "port":8883,"userId":0
+        #            }
+        #        }
+        #    }
+        # }
+        if packet['payload']['bind']['hardware']['subType'] in ('au', 'de', 'eu', 'fr', 'jp', 'uk', 'us'):
+            icon = f"mdi:power-socket-{packet['payload']['bind']['hardware']['subType']}"
+        else:
+            icon = 'mdi:power-socket'
+
+        registration_topic = DISCOVERY_TOPIC.format(outlet_id)
+        registration_packet = {
+            'name': f"Meross {packet['payload']['bind']['hardware']['type']} {outlet_id}",
+            'icon': icon,
+            'unique_id': outlet_id,
+            'command_topic': f'{HOMEASSISTANT_PREFIX}/switch/meross_mqtt/{outlet_id}/0/set',
+            'state_topic': f'{HOMEASSISTANT_PREFIX}/switch/meross_mqtt/{outlet_id}/0/state',
+            'device': {
+                'manufacturer': 'Meross',
+                'identifiers': [outlet_id],
+                'model': f"{packet['payload']['bind']['hardware']['type']}-{packet['payload']['bind']['hardware']['subType']}",
+                'name': f"Meross {packet['payload']['bind']['hardware']['type']}",
+                'sw_version': packet['payload']['bind']['firmware']['version'],
+                'via_device': packet['payload']['bind']['firmware']['wifiMac'],
+                "connections": [
+                    ['mac', packet['payload']['bind']['hardware']['macAddress']],
+                    ['ip', packet['payload']['bind']['firmware']['innerIp']]
+                ],
+            }
+        }
+        print(f'Received Appliance.Control.Bind from {outlet_id}, sending registration packet to {registration_topic}')
+        print(registration_packet)
+        mqtt_send(registration_topic, registration_packet, retain=True)
+
+    if packet['header']['namespace'] == 'Appliance.Control.ToggleX' and packet['header']['method'] == 'PUSH':
+        # This is sent when the state of a plug changes
+        # /appliance/1909186558887525186548e1e9054b50/publish {"header":{"messageId":"e576d260dd651c8c61d6a739ad5a9152","namespace":"Appliance.Control.ToggleX","method":"PUSH","payloadVersion":1,"from":"/appliance/1909186558887525186548e1e9054b50/publish","timestamp":1594520207,"timestampMs":301,"sign":"cff4cf327330cd58ae88bb983535a82c"},"payload":{"togglex":[{"channel":0,"onoff":1,"lmTime":1594520207}]}}
+        print(f'Updated outlet state from {outlet_id}:')
+        for plug in packet['payload']['togglex']:
+            state_topic = f'{HOMEASSISTANT_PREFIX}/switch/meross_mqtt/{outlet_id}/{plug["channel"]}/state'
+            payload = 'ON' if plug['onoff'] == 1 else 'OFF'
+            print(f'Plug {plug["channel"]} set to {plug["onoff"]}')
+            mqtt_send(state_topic, payload, retain=True)
+
+
+if __name__ == '__main__':
+    # Setup and start the mqtt app
+    mqtt = paho.mqtt.client.Client(MQTT_CLIENT_ID)
+    mqtt.on_connect = on_connect
+    mqtt.on_disconnect = on_disconnect
+    mqtt.on_log = on_log
+    mqtt.on_message = on_message
+    mqtt.connect(MQTT_HOST, MQTT_PORT, 60)
+    mqtt.loop_forever()
