@@ -3,6 +3,8 @@ Description=Integrate meross switches with homeassistant locally
 After=network.target
 
 [Service]
+Restart=on-failure
+RestartSec=5s
 User=pi
 Environment=MQTT_HOST=172.16.25.1
 ExecStart=/home/pi/meross_mqtt_ha/meross_mqtt_ha
